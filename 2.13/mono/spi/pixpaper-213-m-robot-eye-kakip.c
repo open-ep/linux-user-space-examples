@@ -12,6 +12,8 @@
  * periodically to clear ghosting.
  *
  * Build (target): gcc -o robot-eye pixpaper-213-m-robot-eye-kakip.c -lgpiod -lm
+ * (libgpiod 1.x or 2.x, see common/gpiod_compat.h)
+ * Usage: robot-eye [/dev/spidevB.C]   (default /dev/spidev1.0)
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,7 +22,6 @@
  */
 
 #include <fcntl.h>
-#include <gpiod.h>
 #include <linux/spi/spidev.h>
 #include <math.h>
 #include <stdint.h>
@@ -31,8 +32,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define EPD_SPI_DEVICE "/dev/spidev0.0"
-#define EPD_GPIO_CHIP "gpiochip0"
+#include "../../../common/gpiod_compat.h"
+
+#define EPD_SPI_DEVICE "/dev/spidev1.0"
+#define EPD_GPIO_CHIP_LABEL "10410000.pinctrl"
 
 #define EPD_DC_PIN 60
 #define EPD_RST_PIN 87
@@ -55,8 +58,8 @@
 #define FULL_REFRESH_EVERY 60 /* partial frames between ghost-clearing full refreshes */
 
 int spi_fd;
-struct gpiod_chip *chip;
-struct gpiod_line *epd_dc_line, *epd_rst_line, *epd_busy_line;
+struct gpio_chip *chip;
+struct gpio_line *epd_dc_line, *epd_rst_line, *epd_busy_line;
 
 static uint8_t fb[EPD_H * EPD_W]; /* 0xFF = white, 0x00 = black */
 static uint8_t packed[EPD_W * 16];
@@ -87,20 +90,20 @@ void spi_write(uint8_t *data, int len) {
 }
 
 void epd_writeCommand(uint8_t command) {
-	gpiod_line_set_value(epd_dc_line, 0);
+	gpio_line_set_value(epd_dc_line, 0);
 	sleep_us(1);
 	spi_write(&command, 1);
 }
 
 void epd_writeData(uint8_t data) {
-	gpiod_line_set_value(epd_dc_line, 1);
+	gpio_line_set_value(epd_dc_line, 1);
 	sleep_us(1);
 	spi_write(&data, 1);
 }
 
 /* bulk data write: one DC toggle, chunked SPI transfers */
 void epd_writeDataBuf(const uint8_t *data, int len) {
-	gpiod_line_set_value(epd_dc_line, 1);
+	gpio_line_set_value(epd_dc_line, 1);
 	sleep_us(1);
 	while (len > 0) {
 		int n = len > 2048 ? 2048 : len;
@@ -113,16 +116,16 @@ void epd_writeDataBuf(const uint8_t *data, int len) {
 void epd_waitUntilIdle() {
 	sleep_ms(2);
 	while (1) {
-		if (gpiod_line_get_value(epd_busy_line) == 0)
+		if (gpio_line_get_value(epd_busy_line) == 0)
 			break;
 	}
 }
 
 void epd_HWreset() {
 	sleep_ms(50);
-	gpiod_line_set_value(epd_rst_line, 0);
+	gpio_line_set_value(epd_rst_line, 0);
 	sleep_ms(50);
-	gpiod_line_set_value(epd_rst_line, 1);
+	gpio_line_set_value(epd_rst_line, 1);
 	sleep_ms(50);
 }
 
@@ -340,8 +343,8 @@ void pick_gaze(int *tx, int *ty) {
 	} while (*tx * *tx + *ty * *ty > GAZE_MAX_X * GAZE_MAX_X);
 }
 
-int main(void) {
-	spi_fd = open(EPD_SPI_DEVICE, O_RDWR);
+int main(int argc, char **argv) {
+	spi_fd = open(argc > 1 ? argv[1] : EPD_SPI_DEVICE, O_RDWR);
 	if (spi_fd < 0) {
 		perror("Error opening SPI device");
 		exit(1);
@@ -352,23 +355,20 @@ int main(void) {
 	uint32_t speed = SPI_SPEED;
 	ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
 
-	chip = gpiod_chip_open_by_name(EPD_GPIO_CHIP);
+	chip = gpio_chip_open_by_label(EPD_GPIO_CHIP_LABEL);
 	if (!chip) {
 		perror("Error opening GPIO chip");
 		exit(1);
 	}
 
-	epd_dc_line = gpiod_chip_get_line(chip, EPD_DC_PIN);
-	epd_rst_line = gpiod_chip_get_line(chip, EPD_RST_PIN);
-	epd_busy_line = gpiod_chip_get_line(chip, EPD_BUSY_PIN);
+	epd_dc_line = gpio_line_request_output(chip, EPD_DC_PIN, "epd_dc", 0);
+	epd_rst_line = gpio_line_request_output(chip, EPD_RST_PIN, "epd_rst", 0);
+	epd_busy_line = gpio_line_request_input(chip, EPD_BUSY_PIN, "epd_busy");
 	if (!epd_dc_line || !epd_rst_line || !epd_busy_line) {
-		perror("Error getting GPIO lines");
-		gpiod_chip_close(chip);
+		perror("Error requesting GPIO lines");
+		gpio_chip_close(chip);
 		exit(1);
 	}
-	gpiod_line_request_output(epd_dc_line, "epd_dc", 0);
-	gpiod_line_request_output(epd_rst_line, "epd_rst", 0);
-	gpiod_line_request_input(epd_busy_line, "epd_busy");
 
 	srand(time(NULL));
 	epd_init();
@@ -394,6 +394,9 @@ int main(void) {
 	}
 
 	close(spi_fd);
-	gpiod_chip_close(chip);
+	gpio_line_release(epd_dc_line);
+	gpio_line_release(epd_rst_line);
+	gpio_line_release(epd_busy_line);
+	gpio_chip_close(chip);
 	return 0;
 }
